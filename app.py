@@ -1,599 +1,880 @@
 import streamlit as st
-import time
-import sqlite3
-
 from google import genai
-from pypdf import PdfReader
+import requests
+import json
+import re
+import time
 
 
-# ============================================================
-# PAGE SETUP
-# ============================================================
+# =========================================================
+# PAGE SETTINGS
+# =========================================================
 
 st.set_page_config(
-    page_title="AI Study Buddy",
+    page_title="Study Buddy",
     page_icon="📚",
     layout="wide"
 )
 
 
-# ============================================================
-# GOOGLE LOGIN
-# ============================================================
-
-if not st.user.is_logged_in:
-
-    st.title("📚 AI Study Buddy")
-
-    st.write("Please sign in with Google to use AI Study Buddy.")
-
-    st.button(
-        "🔐 Sign in with Google",
-        on_click=st.login
-    )
-
-    st.stop()
-
-
-# ============================================================
-# USER INFORMATION
-# ============================================================
-
-user_name = st.user.get("name", "Student")
-user_email = st.user.get("email", "")
-
-
-# ============================================================
-# VISIT DATABASE
-# ============================================================
-
-DATABASE = "visits.db"
-
-
-def setup_database():
-    connection = sqlite3.connect(DATABASE)
-
-    cursor = connection.cursor()
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            email TEXT PRIMARY KEY,
-            name TEXT,
-            visits INTEGER DEFAULT 0
-        )
-    """)
-
-    connection.commit()
-    connection.close()
-
-
-def record_visit(email, name):
-    connection = sqlite3.connect(DATABASE)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT visits FROM users WHERE email = ?",
-        (email,)
-    )
-
-    user = cursor.fetchone()
-
-    if user is None:
-
-        cursor.execute(
-            """
-            INSERT INTO users (email, name, visits)
-            VALUES (?, ?, ?)
-            """,
-            (email, name, 1)
-        )
-
-        visits = 1
-
-    else:
-
-        visits = user[0] + 1
-
-        cursor.execute(
-            """
-            UPDATE users
-            SET name = ?, visits = ?
-            WHERE email = ?
-            """,
-            (name, visits, email)
-        )
-
-    connection.commit()
-    connection.close()
-
-    return visits
-
-
-def get_total_visits():
-    connection = sqlite3.connect(DATABASE)
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        "SELECT COALESCE(SUM(visits), 0) FROM users"
-    )
-
-    total = cursor.fetchone()[0]
-
-    connection.close()
-
-    return total
-
-
-setup_database()
-
-
-# ============================================================
-# COUNT VISIT
-# ============================================================
-
-if "visit_recorded" not in st.session_state:
-
-    my_visits = record_visit(
-        user_email,
-        user_name
-    )
-
-    st.session_state.visit_recorded = True
-    st.session_state.my_visits = my_visits
-
-else:
-
-    my_visits = st.session_state.my_visits
-
-
-total_visits = get_total_visits()
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
-st.sidebar.title("📚 AI Study Buddy")
-
-st.sidebar.write(
-    f"👋 Welcome, **{user_name}**"
-)
-
-st.sidebar.write(
-    f"📧 {user_email}"
-)
-
-st.sidebar.divider()
-
-st.sidebar.metric(
-    "Your Visits",
-    my_visits
-)
-
-st.sidebar.metric(
-    "Total Visits",
-    total_visits
-)
-
-st.sidebar.divider()
-
-st.sidebar.button(
-    "🚪 Sign Out",
-    on_click=st.logout
-)
-
-
-# ============================================================
-# GEMINI API
-# ============================================================
-
-try:
-
-    api_key = st.secrets["GEMINI_API_KEY"]
-
-except Exception:
-
-    st.error(
-        "GEMINI_API_KEY is missing from Streamlit Secrets."
-    )
-
-    st.stop()
-
-
-client = genai.Client(
-    api_key=api_key
-)
-
-
-# ============================================================
-# MAIN APP
-# ============================================================
-
-st.title("📚 AI Study Buddy")
+# =========================================================
+# TITLE
+# =========================================================
+
+st.title("📚 Study Buddy")
 
 st.write(
-    "Upload your notes or PDF and let AI help you study."
+    "Your AI study assistant for questions, quizzes, "
+    "flashcards, study guides, and more."
 )
 
 
-# ============================================================
-# PDF EXTRACTION
-# ============================================================
+# =========================================================
+# API KEYS
+# =========================================================
 
-def extract_pdf_text(pdf_file):
+try:
+    GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
+except KeyError:
+    GEMINI_API_KEY = None
 
-    reader = PdfReader(pdf_file)
-
-    text = ""
-
-    for page in reader.pages:
-
-        page_text = page.extract_text()
-
-        if page_text:
-            text += page_text + "\n"
-
-    return text
+try:
+    OPENROUTER_API_KEY = st.secrets["OPENROUTER_API_KEY"]
+except KeyError:
+    OPENROUTER_API_KEY = None
 
 
-# ============================================================
+# =========================================================
+# GEMINI CLIENT
+# =========================================================
+
+gemini_client = None
+
+if GEMINI_API_KEY:
+
+    try:
+        gemini_client = genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+
+    except Exception:
+        gemini_client = None
+
+
+# =========================================================
+# MODELS
+# =========================================================
+
+GEMINI_MODEL = "gemini-3.8-flash"
+
+OPENROUTER_MODEL = "openrouter/free"
+
+
+# =========================================================
 # GEMINI FUNCTION
-# ============================================================
+# =========================================================
+
+def ask_gemini(prompt):
+
+    if gemini_client is None:
+        return None
+
+    for attempt in range(2):
+
+        try:
+
+            response = gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt
+            )
+
+            if response and response.text:
+                return response.text
+
+            return None
+
+        except Exception as e:
+
+            error_text = str(e)
+
+            # Temporary Gemini overload
+            if (
+                "503" in error_text
+                or "UNAVAILABLE" in error_text
+                or "high demand" in error_text.lower()
+            ):
+
+                if attempt == 0:
+                    time.sleep(3)
+                    continue
+
+                return None
+
+            # Gemini quota exceeded
+            if (
+                "429" in error_text
+                or "RESOURCE_EXHAUSTED" in error_text
+                or "quota" in error_text.lower()
+            ):
+
+                return None
+
+            # Gemini model unavailable
+            if (
+                "404" in error_text
+                or "NOT_FOUND" in error_text
+            ):
+
+                return None
+
+            return None
+
+    return None
+
+
+# =========================================================
+# OPENROUTER FUNCTION
+# =========================================================
+
+def ask_openrouter(prompt):
+
+    if not OPENROUTER_API_KEY:
+        return None
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://ai-study-buddy-ak.streamlit.app",
+        "X-Title": "Study Buddy"
+    }
+
+    data = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt
+            }
+        ]
+    }
+
+    try:
+
+        response = requests.post(
+            url,
+            headers=headers,
+            json=data,
+            timeout=90
+        )
+
+        if response.status_code != 200:
+            return None
+
+        result = response.json()
+
+        choices = result.get(
+            "choices",
+            []
+        )
+
+        if not choices:
+            return None
+
+        message = choices[0].get(
+            "message",
+            {}
+        )
+
+        content = message.get(
+            "content"
+        )
+
+        if content:
+            return content
+
+        return None
+
+    except Exception:
+
+        return None
+
+
+# =========================================================
+# MULTI-AI FUNCTION
+# =========================================================
 
 def ask_ai(prompt):
 
-    models = [
-        "gemini-3.8-flash",
-        "gemini-3.8-flash-lite"
-    ]
+    # Try Gemini first
+    result = ask_gemini(prompt)
 
-    for model in models:
+    if result:
+        return result
 
-        for attempt in range(3):
 
-            try:
+    # If Gemini fails, try OpenRouter
+    result = ask_openrouter(prompt)
 
-                response = client.models.generate_content(
-                    model=model,
-                    contents=prompt
-                )
+    if result:
+        return result
 
-                if response.text:
-                    return response.text
 
-            except Exception as error:
-
-                error_message = str(error)
-
-                if (
-                    "503" in error_message
-                    or "UNAVAILABLE" in error_message
-                ):
-
-                    if attempt < 2:
-                        time.sleep(2 ** attempt)
-                        continue
-
-                break
-
+    # Both failed
     st.error(
-        "Gemini is temporarily unavailable. "
-        "Please wait a moment and try again."
+        "⚠️ The AI services are temporarily unavailable."
+    )
+
+    st.info(
+        "Please try again later."
     )
 
     return None
 
 
-# ============================================================
-# STUDY SETTINGS
-# ============================================================
-
-st.sidebar.subheader("Study Settings")
-
-mode = st.sidebar.selectbox(
-    "What do you want to do?",
-    [
-        "Explain my notes",
-        "Make flashcards",
-        "Create a quiz",
-        "Study guide"
-    ]
-)
-
-num_questions = st.sidebar.slider(
-    "Number of quiz questions",
-    min_value=5,
-    max_value=30,
-    value=10
-)
-
-
-# ============================================================
-# PDF UPLOAD
-# ============================================================
-
-uploaded_file = st.file_uploader(
-    "📄 Upload your notes or PDF",
-    type=["pdf"]
-)
-
-notes = ""
-
-
-if uploaded_file:
-
-    with st.spinner("📖 Reading your notes..."):
-
-        notes = extract_pdf_text(
-            uploaded_file
-        )
-
-    if not notes.strip():
-
-        st.error(
-            "I couldn't extract text from this PDF."
-        )
-
-        st.stop()
-
-    notes = notes[:100000]
-
-    st.success(
-        "✅ Your notes are ready!"
-    )
-
-
-    # ========================================================
-    # EXPLAIN NOTES
-    # ========================================================
-
-    if mode == "Explain my notes":
-
-        if st.button("🧠 Explain My Notes"):
-
-            prompt = f"""
-You are an expert tutor.
-
-Explain the following study material clearly and simply.
-
-Use:
-- Simple language
-- Important definitions
-- Examples
-- Key ideas
-- A short summary
-
-Only use information supported by the study material.
-
-STUDY MATERIAL:
-
-{notes}
-"""
-
-            with st.spinner(
-                "🧠 Creating your explanation..."
-            ):
-
-                answer = ask_ai(prompt)
-
-            if answer:
-
-                st.subheader(
-                    "🧠 Explanation"
-                )
-
-                st.markdown(answer)
-
-
-    # ========================================================
-    # FLASHCARDS
-    # ========================================================
-
-    elif mode == "Make flashcards":
-
-        if st.button("🃏 Generate Flashcards"):
-
-            prompt = f"""
-You are a study assistant.
-
-Create useful flashcards from the study material.
-
-Format them like this:
-
-### Card 1
-**Question:** ...
-**Answer:** ...
-
-### Card 2
-**Question:** ...
-**Answer:** ...
-
-Focus on important concepts.
-
-Only use information supported by the study material.
-
-STUDY MATERIAL:
-
-{notes}
-"""
-
-            with st.spinner(
-                "🃏 Creating flashcards..."
-            ):
-
-                answer = ask_ai(prompt)
-
-            if answer:
-
-                st.subheader(
-                    "🃏 Flashcards"
-                )
-
-                st.markdown(answer)
-
-
-    # ========================================================
-    # QUIZ
-    # ========================================================
-
-    elif mode == "Create a quiz":
-
-        if st.button("❓ Generate Quiz"):
-
-            prompt = f"""
-You are an expert teacher.
-
-Create a {num_questions}-question practice quiz
-based ONLY on the study material.
-
-Use a mixture of:
-- Multiple choice
-- True/false
-- Short answer
-
-Do not give answers immediately after each question.
-
-At the end, create:
-
-ANSWER KEY
-
-Then list the correct answers.
-
-Only use information supported by the study material.
-
-STUDY MATERIAL:
-
-{notes}
-"""
-
-            with st.spinner(
-                "❓ Creating quiz..."
-            ):
-
-                answer = ask_ai(prompt)
-
-            if answer:
-
-                st.subheader(
-                    "❓ Practice Quiz"
-                )
-
-                st.markdown(answer)
-
-
-    # ========================================================
-    # STUDY GUIDE
-    # ========================================================
-
-    elif mode == "Study guide":
-
-        if st.button("📖 Create Study Guide"):
-
-            prompt = f"""
-You are an expert study coach.
-
-Turn the study material into a clear study guide.
-
-Include:
-
-1. Main topics
-2. Important vocabulary
-3. Important facts
-4. Concepts students commonly confuse
-5. Examples
-6. Things to memorize
-7. Final review
-
-Only use information supported by the material.
-
-STUDY MATERIAL:
-
-{notes}
-"""
-
-            with st.spinner(
-                "📖 Creating study guide..."
-            ):
-
-                answer = ask_ai(prompt)
-
-            if answer:
-
-                st.subheader(
-                    "📖 Study Guide"
-                )
-
-                st.markdown(answer)
-
-
-# ============================================================
-# ASK STUDY BUDDY
-# ============================================================
+# =========================================================
+# NOTES
+# =========================================================
 
 st.divider()
 
-st.subheader(
-    "💬 Ask Your Study Buddy"
+st.header("📖 Your Notes")
+
+notes = st.text_area(
+    "Paste your notes here",
+    height=300,
+    placeholder=(
+        "Paste your class notes here..."
+    )
 )
 
-question = st.text_input(
-    "Ask a question about your uploaded notes:"
+
+# =========================================================
+# ASK AI ANYTHING
+# =========================================================
+
+st.divider()
+
+st.header("🤖 Ask Study Buddy Anything")
+
+st.write(
+    "Ask a question or give Study Buddy a task."
+)
+
+user_request = st.text_area(
+    "What would you like me to do?",
+    height=150,
+    placeholder=(
+        "Examples:\n"
+        "• Explain photosynthesis in simple words.\n"
+        "• Help me understand this math problem.\n"
+        "• Summarize my notes.\n"
+        "• Make me a study plan.\n"
+        "• Create practice questions.\n"
+        "• Explain this topic like I'm a beginner."
+    ),
+    key="user_request"
 )
 
 
-if question:
+if st.button(
+    "🤖 Ask Study Buddy",
+    use_container_width=True
+):
 
-    if not uploaded_file:
+    if not user_request.strip():
 
         st.warning(
-            "📄 Please upload your notes or PDF first."
+            "Please enter something for Study Buddy to do."
         )
 
     else:
 
         prompt = f"""
-You are a helpful AI tutor.
+You are Study Buddy, a helpful AI assistant.
 
-Answer the student's question using ONLY the
-study material below.
+Help the student with their request.
 
-If the answer cannot be found in the material,
-say that clearly instead of making something up.
+You can help with:
+- School subjects
+- Explanations
+- Summaries
+- Study plans
+- Brainstorming
+- Practice questions
+- Writing assistance
+- General questions
+- Step-by-step educational explanations
+- Other reasonable tasks the user asks for
 
-Give a clear and student-friendly explanation.
+If the request involves schoolwork, explain the
+reasoning clearly so the student can understand it.
 
-STUDY MATERIAL:
+If notes are provided, use them when relevant.
 
-{notes}
+Do not invent information.
 
-STUDENT QUESTION:
+USER REQUEST:
 
-{question}
+{user_request}
+
+STUDENT NOTES:
+
+{notes if notes.strip() else "No notes were provided."}
 """
 
         with st.spinner(
-            "🤔 Thinking..."
+            "🤖 Study Buddy is thinking..."
         ):
 
             answer = ask_ai(prompt)
 
         if answer:
 
-            st.subheader(
-                "🤖 Study Buddy"
+            st.session_state.last_answer = answer
+
+
+# =========================================================
+# DISPLAY AI ANSWER
+# =========================================================
+
+if "last_answer" in st.session_state:
+
+    st.divider()
+
+    st.header("💬 Study Buddy's Answer")
+
+    st.markdown(
+        st.session_state.last_answer
+    )
+
+
+# =========================================================
+# STUDY TOOLS
+# =========================================================
+
+st.divider()
+
+st.header("🎓 Study Tools")
+
+option = st.selectbox(
+    "Choose a tool:",
+    [
+        "📝 Quiz",
+        "🧠 Flashcards",
+        "📚 Study Guide",
+        "💡 Explain My Notes"
+    ]
+)
+
+
+# =========================================================
+# QUIZ GENERATOR
+# =========================================================
+
+def generate_quiz(notes):
+
+    prompt = f"""
+Create a 10-question multiple-choice quiz using ONLY
+the information in the student's notes.
+
+Return ONLY valid JSON.
+
+Use exactly this format:
+
+[
+  {{
+    "question": "Question here",
+    "options": [
+      "Option A",
+      "Option B",
+      "Option C",
+      "Option D"
+    ],
+    "answer": 0,
+    "explanation": "Short explanation"
+  }}
+]
+
+The answer number means:
+
+0 = first option
+1 = second option
+2 = third option
+3 = fourth option
+
+Do not include markdown.
+Do not include anything outside the JSON.
+
+NOTES:
+
+{notes}
+"""
+
+    result = ask_ai(prompt)
+
+    if not result:
+        return None
+
+    try:
+
+        result = result.strip()
+
+        result = re.sub(
+            r"```json|```",
+            "",
+            result
+        ).strip()
+
+        return json.loads(result)
+
+    except Exception as e:
+
+        st.error(
+            "❌ The AI returned an invalid quiz."
+        )
+
+        st.code(str(e))
+
+        return None
+
+
+# =========================================================
+# FLASHCARD GENERATOR
+# =========================================================
+
+def generate_flashcards(notes):
+
+    prompt = f"""
+Create 15 flashcards using ONLY the student's notes.
+
+Return ONLY valid JSON.
+
+Use exactly this format:
+
+[
+  {{
+    "question": "Question here",
+    "answer": "Answer here"
+  }}
+]
+
+Make each question useful for studying.
+
+Do not include markdown.
+Do not include anything outside the JSON.
+
+NOTES:
+
+{notes}
+"""
+
+    result = ask_ai(prompt)
+
+    if not result:
+        return None
+
+    try:
+
+        result = result.strip()
+
+        result = re.sub(
+            r"```json|```",
+            "",
+            result
+        ).strip()
+
+        return json.loads(result)
+
+    except Exception as e:
+
+        st.error(
+            "❌ The AI returned invalid flashcards."
+        )
+
+        st.code(str(e))
+
+        return None
+
+
+# =========================================================
+# STUDY GUIDE
+# =========================================================
+
+def generate_study_guide(notes):
+
+    return f"""
+You are Study Buddy, a helpful school study assistant.
+
+Turn the student's notes into a clear and organized
+study guide.
+
+Use these sections:
+
+# 📌 Main Topics
+
+# 📖 Important Vocabulary
+
+# ⭐ Key Facts
+
+# 🧠 Important Concepts
+
+# ❗ Things to Remember
+
+# 📝 Quick Review
+
+Explain difficult ideas using simple language.
+
+Only use information supported by the notes.
+
+NOTES:
+
+{notes}
+"""
+
+
+# =========================================================
+# EXPLAIN NOTES
+# =========================================================
+
+def generate_explanation(notes):
+
+    return f"""
+You are Study Buddy, a helpful school study assistant.
+
+Explain the student's notes in simple language.
+
+For each major topic:
+
+- Explain what it means.
+- Explain the important idea.
+- Define difficult vocabulary.
+- Give a simple example when useful.
+- Explain what the student should remember.
+
+Make the explanation easy for a student to understand.
+
+Do not invent information that is not supported by
+the student's notes.
+
+NOTES:
+
+{notes}
+"""
+
+
+# =========================================================
+# GENERATE STUDY TOOL
+# =========================================================
+
+if st.button(
+    "✨ Generate Study Tool",
+    use_container_width=True
+):
+
+    if not notes.strip():
+
+        st.warning(
+            "⚠️ Please paste your notes first."
+        )
+
+        st.stop()
+
+
+    # -----------------------------------------------------
+    # QUIZ
+    # -----------------------------------------------------
+
+    if option == "📝 Quiz":
+
+        with st.spinner(
+            "🤖 Creating your quiz..."
+        ):
+
+            quiz = generate_quiz(notes)
+
+        if quiz:
+
+            st.session_state.quiz = quiz
+
+            st.session_state.quiz_answers = {}
+
+            st.session_state.quiz_submitted = {}
+
+
+    # -----------------------------------------------------
+    # FLASHCARDS
+    # -----------------------------------------------------
+
+    elif option == "🧠 Flashcards":
+
+        with st.spinner(
+            "🤖 Creating your flashcards..."
+        ):
+
+            flashcards = generate_flashcards(notes)
+
+        if flashcards:
+
+            st.session_state.flashcards = flashcards
+
+
+    # -----------------------------------------------------
+    # STUDY GUIDE
+    # -----------------------------------------------------
+
+    elif option == "📚 Study Guide":
+
+        with st.spinner(
+            "🤖 Creating your study guide..."
+        ):
+
+            result = ask_ai(
+                generate_study_guide(notes)
             )
 
-            st.markdown(answer)
+        if result:
+
+            st.session_state.study_guide = result
 
 
-# ============================================================
+    # -----------------------------------------------------
+    # EXPLAIN NOTES
+    # -----------------------------------------------------
+
+    elif option == "💡 Explain My Notes":
+
+        with st.spinner(
+            "🤖 Explaining your notes..."
+        ):
+
+            result = ask_ai(
+                generate_explanation(notes)
+            )
+
+        if result:
+
+            st.session_state.explanation = result
+
+
+# =========================================================
+# FLASHCARDS DISPLAY
+# =========================================================
+
+if "flashcards" in st.session_state:
+
+    st.divider()
+
+    st.header("🧠 Flashcards")
+
+    st.write(
+        "Click a question to reveal the answer."
+    )
+
+    for i, card in enumerate(
+        st.session_state.flashcards
+    ):
+
+        with st.expander(
+            f"❓ {card['question']}"
+        ):
+
+            st.success(
+                f"💡 {card['answer']}"
+            )
+
+
+# =========================================================
+# QUIZ DISPLAY
+# =========================================================
+
+if "quiz" in st.session_state:
+
+    st.divider()
+
+    st.header("📝 Quiz")
+
+    quiz = st.session_state.quiz
+
+    for i, question in enumerate(quiz):
+
+        st.subheader(
+            f"Question {i + 1} of {len(quiz)}"
+        )
+
+        st.write(
+            question["question"]
+        )
+
+        submitted = (
+            st.session_state.quiz_submitted.get(
+                i,
+                False
+            )
+        )
+
+        # -------------------------------------------------
+        # BEFORE ANSWER
+        # -------------------------------------------------
+
+        if not submitted:
+
+            answer = st.radio(
+                "Choose your answer:",
+                question["options"],
+                key=f"quiz_answer_{i}",
+                index=None
+            )
+
+            if st.button(
+                "Submit Answer",
+                key=f"submit_{i}"
+            ):
+
+                if answer is None:
+
+                    st.warning(
+                        "Please choose an answer first."
+                    )
+
+                else:
+
+                    selected_index = (
+                        question["options"].index(
+                            answer
+                        )
+                    )
+
+                    st.session_state.quiz_answers[i] = (
+                        selected_index
+                    )
+
+                    st.session_state.quiz_submitted[i] = (
+                        True
+                    )
+
+                    st.rerun()
+
+        # -------------------------------------------------
+        # AFTER ANSWER
+        # -------------------------------------------------
+
+        else:
+
+            selected_index = (
+                st.session_state.quiz_answers[i]
+            )
+
+            correct_index = (
+                question["answer"]
+            )
+
+            if selected_index == correct_index:
+
+                st.success(
+                    "✅ Correct!"
+                )
+
+            else:
+
+                st.error(
+                    "❌ Incorrect."
+                )
+
+            st.info(
+                "Correct answer: "
+                + question["options"][correct_index]
+            )
+
+            st.write(
+                "**Explanation:** "
+                + question["explanation"]
+            )
+
+
+# =========================================================
+# QUIZ SCORE
+# =========================================================
+
+if "quiz" in st.session_state:
+
+    quiz = st.session_state.quiz
+
+    submitted_count = len(
+        st.session_state.quiz_submitted
+    )
+
+    if submitted_count == len(quiz):
+
+        score = 0
+
+        for i, question in enumerate(quiz):
+
+            if (
+                st.session_state.quiz_answers.get(i)
+                == question["answer"]
+            ):
+
+                score += 1
+
+        st.divider()
+
+        st.header("🏆 Quiz Complete!")
+
+        st.write(
+            f"You scored **{score}/{len(quiz)}**."
+        )
+
+        if st.button(
+            "🔄 Make Another Quiz"
+        ):
+
+            del st.session_state.quiz
+
+            st.session_state.quiz_answers = {}
+
+            st.session_state.quiz_submitted = {}
+
+            st.rerun()
+
+
+# =========================================================
+# STUDY GUIDE DISPLAY
+# =========================================================
+
+if "study_guide" in st.session_state:
+
+    st.divider()
+
+    st.header("📚 Your Study Guide")
+
+    st.markdown(
+        st.session_state.study_guide
+    )
+
+
+# =========================================================
+# EXPLANATION DISPLAY
+# =========================================================
+
+if "explanation" in st.session_state:
+
+    st.divider()
+
+    st.header("💡 Explanation")
+
+    st.markdown(
+        st.session_state.explanation
+    )
+
+
+# =========================================================
 # FOOTER
-# ============================================================
+# =========================================================
 
 st.divider()
 
 st.caption(
-    "📚 AI Study Buddy • Powered by Google Gemini"
+    "📚 Study Buddy • AI-powered learning assistant"
 )
